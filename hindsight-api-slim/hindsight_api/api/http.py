@@ -3163,7 +3163,13 @@ def create_app(
 
         # Shutdown worker poller if running
         if poller is not None:
-            await poller.shutdown_graceful(timeout=30.0)
+            # HS-M2: grace configurable (default 30s) so an in-flight retain isn't
+            # cancelled mid-LLM-call on service stop. See worker/main.py.
+            import os
+
+            await poller.shutdown_graceful(
+                timeout=float(os.environ.get("HINDSIGHT_API_SHUTDOWN_GRACE", "30.0"))
+            )
             if poller_task is not None:
                 poller_task.cancel()
                 try:

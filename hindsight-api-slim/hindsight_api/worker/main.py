@@ -331,7 +331,13 @@ def main():
         server.should_exit = True
 
         print("Waiting for poller to finish...")
-        await poller.shutdown_graceful(timeout=30.0)
+        # HS-M2: grace configurable so an in-flight retain (LLM call up to
+        # HINDSIGHT_API_LLM_TIMEOUT=300s) isn't cancelled at a hardcoded 30s on
+        # service stop. Keep 30s default for upstream; deployments set it under
+        # systemd TimeoutStopSec.
+        await poller.shutdown_graceful(
+            timeout=float(os.environ.get("HINDSIGHT_API_SHUTDOWN_GRACE", "30.0"))
+        )
         poller_task.cancel()
         try:
             await poller_task
