@@ -613,6 +613,10 @@ class OpenAIEmbeddings(Embeddings):
         self.batch_size = batch_size
         self.dimensions = dimensions
         self.max_retries = max_retries
+        # Optional client-side character cap per input. OpenAI-compatible local
+        # backends (llama.cpp) hard-reject inputs beyond the model context instead
+        # of truncating like the local ST provider does; 0 disables the cap.
+        self.truncate_chars = int(os.environ.get("HINDSIGHT_API_EMBEDDINGS_OPENAI_TRUNCATE_CHARS", "0") or 0)
         self._client = None
         self._dimension: int | None = None
 
@@ -688,6 +692,15 @@ class OpenAIEmbeddings(Embeddings):
             return []
 
         all_embeddings = []
+
+        if self.truncate_chars > 0:
+            oversized = sum(1 for t in texts if len(t) > self.truncate_chars)
+            if oversized:
+                logger.warning(
+                    f"Embeddings: truncating {oversized} input(s) above {self.truncate_chars} chars "
+                    f"(HINDSIGHT_API_EMBEDDINGS_OPENAI_TRUNCATE_CHARS)"
+                )
+                texts = [t[: self.truncate_chars] for t in texts]
 
         # Process in batches
         for i in range(0, len(texts), self.batch_size):
