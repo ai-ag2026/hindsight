@@ -1862,7 +1862,7 @@ async def _execute_update_action(
     )
 
     t0 = time.time()
-    await conn.execute(
+    update_status = await conn.execute(
         f"""
         UPDATE {fq_table("memory_units")}
         SET text = $1,
@@ -1886,6 +1886,22 @@ async def _execute_update_action(
         source_mentioned_at,
         merged_tags,
     )
+
+    # If the observation row was concurrently deleted/invalidated, the UPDATE
+    # matches 0 rows. Bail out BEFORE writing observation_history — that INSERT
+    # carries an observation_id FK onto memory_units, so appending history for a
+    # now-missing row raises ForeignKeyViolationError (orphan/integrity failure).
+    updated_rows = (
+        int(update_status.split()[-1])
+        if isinstance(update_status, str) and update_status.startswith("UPDATE")
+        else 0
+    )
+    if updated_rows == 0:
+        logger.debug(
+            f"Update skipped: observation {observation_id} no longer exists "
+            "(deleted/invalidated concurrently); not appending history"
+        )
+        return None
 
     # Record the pre-update snapshot in the dedicated observation_history table
     # (one row per change), then trim to the configured cap. History lived in a
