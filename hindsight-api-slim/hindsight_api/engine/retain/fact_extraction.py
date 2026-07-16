@@ -15,7 +15,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from ..llm_interface import ProviderRateLimitResetError
-from ..llm_wrapper import LLMConfig, OutputTooLongError, sanitize_llm_output
+from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
 from .entity_labels import (
@@ -230,6 +230,55 @@ class FactExtractionResponse(BaseModel):
     """Response containing all extracted facts (causal relations are embedded in each fact)."""
 
     facts: list[ExtractedFact] = Field(description="List of extracted factual statements")
+
+
+def _split_chunk_for_output_retry(chunk: str) -> tuple[str, str] | None:
+    """Split an oversized extraction chunk without corrupting structured input."""
+    stripped = chunk.strip()
+    if len(stripped) <= 1:
+        return None
+
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+
+    if isinstance(parsed, list):
+        if len(parsed) >= 2:
+            mid = len(parsed) // 2
+            return json.dumps(parsed[:mid]), json.dumps(parsed[mid:])
+
+        if len(parsed) == 1 and isinstance(parsed[0], dict):
+            turn = parsed[0]
+            content = turn.get("content")
+            if isinstance(content, str) and len(content) > 1:
+                cut = len(content) // 2
+                first_turn = dict(turn)
+                second_turn = dict(turn)
+                first_turn["content"] = content[:cut]
+                second_turn["content"] = content[cut:]
+                return json.dumps([first_turn]), json.dumps([second_turn])
+
+        return None
+
+    # Split plain text at the midpoint, preferring sentence boundaries nearby.
+    mid_point = len(stripped) // 2
+    search_range = int(len(stripped) * 0.2)
+    search_start = max(0, mid_point - search_range)
+    search_end = min(len(stripped), mid_point + search_range)
+
+    best_split = mid_point
+    for ending in [". ", "! ", "? ", "\n\n"]:
+        pos = stripped.rfind(ending, search_start, search_end)
+        if pos != -1:
+            best_split = pos + len(ending)
+            break
+
+    first_half = stripped[:best_split].strip()
+    second_half = stripped[best_split:].strip()
+    if not first_half or not second_half or first_half == stripped or second_half == stripped:
+        return None
+    return first_half, second_half
 
 
 class ExtractedFactVerbose(BaseModel):
@@ -1236,6 +1285,15 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
     return request_body
 
 
+def _coerce_fact_response(response: Any) -> dict[str, Any] | None:
+    """Accept the schema wrapper, or a recoverable top-level facts array."""
+    if isinstance(response, dict):
+        return response
+    if isinstance(response, list) and all(isinstance(item, dict) for item in response):
+        return {"facts": response}
+    return None
+
+
 async def _extract_facts_from_chunk(
     chunk: str,
     chunk_index: int,
@@ -1341,7 +1399,8 @@ async def _extract_facts_from_chunk(
             has_malformed_facts = False
 
             # Handle malformed LLM responses
-            if not isinstance(extraction_response_json, dict):
+            coerced_response_json = _coerce_fact_response(extraction_response_json)
+            if coerced_response_json is None:
                 if attempt < llm_max_retries - 1:
                     logger.warning(
                         f"LLM returned non-dict JSON on attempt {attempt + 1}/{llm_max_retries}: {type(extraction_response_json).__name__}. Retrying..."
@@ -1356,6 +1415,7 @@ async def _extract_facts_from_chunk(
                         f"Fact extraction failed: LLM returned non-dict JSON after {llm_max_retries} attempts "
                         f"({type(extraction_response_json).__name__}). Raw: {str(extraction_response_json)[:500]}"
                     )
+            extraction_response_json = coerced_response_json
 
             raw_facts = extraction_response_json.get("facts", [])
 
@@ -1664,33 +1724,22 @@ async def _extract_facts_with_auto_split(
             metadata=metadata,
         )
     except OutputTooLongError:
-        # Output exceeded token limits - split the chunk in half and retry
+        # Output exceeded token limits - split the chunk and retry. Conversation
+        # chunks are JSON arrays, so preserve array/turn boundaries when possible.
         logger.warning(
             f"Output too long for chunk {chunk_index + 1}/{total_chunks} "
-            f"({len(chunk)} chars). Splitting in half and retrying..."
+            f"({len(chunk)} chars). Splitting and retrying..."
         )
 
-        # Split at the midpoint, preferring sentence boundaries
-        mid_point = len(chunk) // 2
+        split_chunks = _split_chunk_for_output_retry(chunk)
+        if split_chunks is None:
+            logger.warning(
+                f"Cannot make progress splitting chunk {chunk_index + 1}/{total_chunks} "
+                f"({len(chunk)} chars); dropping this sub-chunk."
+            )
+            return [], TokenUsage()
 
-        # Try to find a sentence boundary near the midpoint
-        # Look for ". ", "! ", "? " within 20% of midpoint
-        search_range = int(len(chunk) * 0.2)
-        search_start = max(0, mid_point - search_range)
-        search_end = min(len(chunk), mid_point + search_range)
-
-        sentence_endings = [". ", "! ", "? ", "\n\n"]
-        best_split = mid_point
-
-        for ending in sentence_endings:
-            pos = chunk.rfind(ending, search_start, search_end)
-            if pos != -1:
-                best_split = pos + len(ending)
-                break
-
-        # Split the chunk
-        first_half = chunk[:best_split].strip()
-        second_half = chunk[best_split:].strip()
+        first_half, second_half = split_chunks
 
         logger.info(
             f"Split chunk {chunk_index + 1} into two sub-chunks: {len(first_half)} chars and {len(second_half)} chars"
@@ -2132,9 +2181,25 @@ async def extract_facts_from_contents_batch_api(
         content_str = message.get("content", "{}")
 
         try:
-            extraction_response_json = json.loads(content_str)
+            # #2701: use the lenient parser (strips markdown fences, scrubs
+            # embedded control chars) so recoverable batch responses — e.g.
+            # transient Gemini quirks — aren't dropped along with all their facts.
+            extraction_response_json = parse_llm_json(content_str)
         except json.JSONDecodeError as e:
             message = f"{custom_id}: failed to parse JSON: {e}"
+            logger.error(message)
+            extraction_errors.add(message)
+            chunks_metadata.append(
+                ChunkMetadata(
+                    chunk_text=chunk_content, fact_count=0, content_index=content_index, chunk_index=chunk_idx
+                )
+            )
+            continue
+
+        response_type_name = type(extraction_response_json).__name__
+        extraction_response_json = _coerce_fact_response(extraction_response_json)
+        if extraction_response_json is None:
+            message = f"{custom_id}: LLM returned non-dict JSON ({response_type_name})"
             logger.error(message)
             extraction_errors.add(message)
             chunks_metadata.append(

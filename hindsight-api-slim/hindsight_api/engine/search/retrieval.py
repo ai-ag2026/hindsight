@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from ...config import get_config
+from ...config import DEFAULT_BM25_MAX_QUERY_TERMS, get_config
 from ..db_utils import acquire_with_retry
 from ..memory_engine import fq_table
 from ..sql import create_sql_dialect
@@ -222,7 +222,12 @@ async def retrieve_semantic_bm25_combined(
     # --- BM25 UNION ALL arms (one per fact_type, only when tokens present) ---
     if _include_bm25:
         text_ext = config.text_search_extension
-        bm25_text_param: str = dialect.prepare_bm25_text(tokens, query_text, text_search_extension=text_ext)
+        bm25_text_param: str = dialect.prepare_bm25_text(
+            tokens,
+            query_text,
+            text_search_extension=text_ext,
+            max_query_terms=getattr(config, "bm25_max_query_terms", DEFAULT_BM25_MAX_QUERY_TERMS),
+        )
         for i, ft in enumerate(fact_types):
             arms.append(
                 dialect.build_bm25_arm(
@@ -793,7 +798,7 @@ async def retrieve_all_fact_types_parallel(
                 tc_start,
                 tc_end,
                 budget=thinking_budget,
-                semantic_threshold=min_semantic if min_semantic is not None else 0.1,
+                semantic_threshold=0.1,
                 tags=tags,
                 tags_match=tags_match,
                 tag_groups=tag_groups,

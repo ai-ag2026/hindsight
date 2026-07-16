@@ -17,6 +17,7 @@ import traceback
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from ..engine.schema import fq_table_explicit as fq_table
@@ -37,6 +38,19 @@ def _metric_operation_label(operation_type: str | None) -> str:
     return operation_type or "unknown"
 
 
+def _updated_row_count(result: Any) -> int:
+    """Extract a row count from backend execute() results."""
+    if isinstance(result, int):
+        return result
+    if isinstance(result, str):
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except (TypeError, ValueError):
+            return 0
+    rowcount = getattr(result, "rowcount", None)
+    return rowcount if isinstance(rowcount, int) else 0
+
+
 if TYPE_CHECKING:
     from hindsight_api.engine.db.base import DatabaseBackend, DatabaseConnection
     from hindsight_api.extensions.tenant import TenantExtension
@@ -45,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 # Progress logging interval in seconds
 PROGRESS_LOG_INTERVAL = 30
+OPERATION_CLEANUP_INTERVAL_SECONDS = 60
 
 # Stuck-task stack-dump thresholds (seconds). Each task gets one stack dump
 # per threshold it crosses (5min, 10min, 20min, 40min, 80min...).
@@ -148,6 +163,8 @@ class WorkerPoller:
         max_slots: int = 10,
         slot_reservations: dict[str, int] | None = None,
         consolidation_bank_priority: dict[str, int] | None = None,
+        operation_retention_days: int = 30,
+        operation_cleanup_batch_size: int = 1000,
     ):
         """
         Initialize the worker poller.
@@ -170,7 +187,15 @@ class WorkerPoller:
                 Patterns support ``*`` as wildcard. A bare ``*`` key is the catch-all default.
                 When set, consolidation tasks are claimed in priority tiers rather than
                 pure created_at order. None or empty dict preserves current behavior.
+            operation_retention_days: Days to retain completed, failed, and cancelled
+                operation rows with their payload and metadata. Zero disables cleanup.
+            operation_cleanup_batch_size: Maximum terminal rows deleted per schema
+                during each cleanup cycle.
         """
+        if operation_retention_days < 0:
+            raise ValueError("operation_retention_days must be >= 0")
+        if operation_cleanup_batch_size < 1:
+            raise ValueError("operation_cleanup_batch_size must be >= 1")
         self._backend = backend
         self._worker_id = worker_id
         self._executor = executor
@@ -191,6 +216,9 @@ class WorkerPoller:
         self._consolidation_bank_priority: dict[str, int] | None = (
             consolidation_bank_priority if consolidation_bank_priority else None
         )
+        self._operation_retention_days = operation_retention_days
+        self._operation_cleanup_batch_size = operation_cleanup_batch_size
+        self._last_operation_cleanup_monotonic: float | None = None
         # Cache of which optional PG routines are installed on the server
         # (probed once, memoised for the life of the poller).
         from ..engine.db.optional_routines import OptionalRoutines
@@ -209,6 +237,9 @@ class WorkerPoller:
         # Rotation offset for per-tenant fair claiming. Advances past the last
         # schema we serviced so a busy tenant can't monopolize the poll order.
         self._next_schema_idx: int = 0
+        # Retention cleanup runs outside the claim loop. Keep one task per
+        # poller so maintenance cannot overlap with itself or block slot refill.
+        self._operation_cleanup_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def _normalize_poll_schema(schema: str | None) -> str | None:
@@ -222,6 +253,67 @@ class WorkerPoller:
         tenants = await self._tenant_extension.list_tenants()
         # Convert default schema to None for SQL compatibility (no prefix), keep others as-is
         return [self._normalize_poll_schema(t.schema) for t in tenants]
+
+    async def _cleanup_terminal_operations_if_due(self) -> None:
+        """Schedule one cleanup sweep without blocking the task-claiming loop."""
+        if self._operation_retention_days == 0:
+            return
+        if self._operation_cleanup_task is not None and not self._operation_cleanup_task.done():
+            return
+
+        now = time.monotonic()
+        if (
+            self._last_operation_cleanup_monotonic is not None
+            and now - self._last_operation_cleanup_monotonic < OPERATION_CLEANUP_INTERVAL_SECONDS
+        ):
+            return
+        # Advance the guard before scheduling so a failing database cannot turn
+        # the tight poll loop into an unbounded maintenance retry loop.
+        self._last_operation_cleanup_monotonic = now
+        self._operation_cleanup_task = asyncio.create_task(self._cleanup_terminal_operations())
+
+    async def _cleanup_terminal_operations(self) -> None:
+        """Prune one bounded terminal-operation batch from every tenant schema."""
+        try:
+            schemas = await self._get_schemas()
+        except Exception as e:
+            logger.warning(f"Worker {self._worker_id} failed to discover schemas for operation cleanup: {e}")
+            return
+
+        # Oracle resolves unqualified table names from a context-bound session
+        # schema. Bind every iteration before acquiring its connection; on
+        # PostgreSQL this is harmless and fq_table remains explicit.
+        from ..engine.memory_engine import _current_schema
+
+        cutoff = datetime.now(UTC) - timedelta(days=self._operation_retention_days)
+        for schema in schemas:
+            table = fq_table("async_operations", schema)
+            schema_display = f'"{schema}"' if schema else "default"
+            schema_token = _current_schema.set(schema)
+            try:
+                async with self._backend.acquire() as conn:
+                    async with conn.transaction():
+                        deleted = await self._backend.ops.prune_terminal_operations(
+                            conn,
+                            table,
+                            cutoff,
+                            batch_size=self._operation_cleanup_batch_size,
+                        )
+                if deleted:
+                    logger.info(
+                        f"Worker {self._worker_id} pruned {deleted} expired terminal operations "
+                        f"from schema {schema_display}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Worker {self._worker_id} failed to prune terminal operations from schema {schema_display}: {e}"
+                )
+            finally:
+                _current_schema.reset(schema_token)
+
+        # Measure the next interval from completion as well as from the initial
+        # attempt. A slow multi-schema sweep remains bounded to one active task.
+        self._last_operation_cleanup_monotonic = time.monotonic()
 
     async def _scan_active_schemas(self, schemas: list[str | None]) -> set[str | None]:
         """Find which schemas have pending work.
@@ -504,17 +596,20 @@ class WorkerPoller:
                 return result
 
     async def _mark_completed(self, operation_id: str, schema: str | None):
-        """Mark a task as completed."""
+        """Mark a processing task as completed, then propagate to parent if needed."""
         table = fq_table("async_operations", schema)
         async with self._backend.acquire() as conn:
-            await conn.execute(
-                f"""
-                UPDATE {table}
-                SET status = 'completed', completed_at = now(), updated_at = now()
-                WHERE operation_id = $1
-                """,
-                operation_id,
-            )
+            async with conn.transaction():
+                result = await conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'completed', completed_at = now(), updated_at = now()
+                    WHERE operation_id = $1 AND status = 'processing'
+                    """,
+                    operation_id,
+                )
+                if _updated_row_count(result):
+                    await self._maybe_update_parent_operation(operation_id, schema, conn)
 
     async def _mark_failed(self, operation_id: str, error_message: str, schema: str | None):
         """Mark a task as failed with error message, then propagate to parent if applicable."""
@@ -749,6 +844,7 @@ class WorkerPoller:
                 task.task_dict["_schema"] = task.schema
             await self._executor(task.task_dict)
             logger.debug(f"Task {task.operation_id} execution finished")
+            await self._mark_completed(task.operation_id, task.schema)
             terminal_success = True
         except DeferOperation as e:
             # Deferral is not a terminal outcome — do not record a completion.
@@ -938,6 +1034,13 @@ class WorkerPoller:
                     for task in tasks:
                         await self.execute_task(task)
 
+                # Run maintenance after newly claimed work has started. Keeping
+                # this before the continue/sleep split means a perpetually
+                # non-empty queue cannot starve cleanup, while a large tenant
+                # sweep cannot delay the first available task either.
+                await self._cleanup_terminal_operations_if_due()
+
+                if tasks:
                     # Continue immediately to claim more tasks (if slots available)
                     continue
 
@@ -962,6 +1065,14 @@ class WorkerPoller:
                 traceback.print_exc()
                 # Backoff on error
                 await asyncio.sleep(1)
+
+        cleanup_task = self._operation_cleanup_task
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
 
         logger.info(f"Worker {self._worker_id} polling loop stopped")
 

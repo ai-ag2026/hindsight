@@ -438,6 +438,7 @@ def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults:
         reasoning_effort=member.reasoning_effort or config.llm_reasoning_effort,
         extra_body=member.extra_body,
         default_headers=member.default_headers or config.llm_default_headers,
+        ollama_num_ctx=config.llm_ollama_num_ctx,
         bedrock_service_tier=member.bedrock_service_tier,
         gemini_service_tier=member.gemini_service_tier or config.llm_gemini_service_tier,
         gemini_safety_settings=_get_raw_config().llm_gemini_safety_settings,
@@ -1089,6 +1090,7 @@ class MemoryEngine(MemoryEngineInterface):
             reasoning_effort=config.llm_reasoning_effort,
             extra_body=config.llm_extra_body,
             default_headers=config.llm_default_headers,
+            ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
             gemini_service_tier=config.llm_gemini_service_tier,
@@ -1133,6 +1135,7 @@ class MemoryEngine(MemoryEngineInterface):
             reasoning_effort=config.llm_reasoning_effort,
             extra_body=config.llm_extra_body,
             default_headers=config.llm_default_headers,
+            ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.retain_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
             gemini_service_tier=config.llm_gemini_service_tier,
@@ -1171,6 +1174,7 @@ class MemoryEngine(MemoryEngineInterface):
             reasoning_effort=config.llm_reasoning_effort,
             extra_body=config.llm_extra_body,
             default_headers=config.llm_default_headers,
+            ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.reflect_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
             gemini_service_tier=config.llm_gemini_service_tier,
@@ -1209,6 +1213,7 @@ class MemoryEngine(MemoryEngineInterface):
             reasoning_effort=config.llm_reasoning_effort,
             extra_body=config.llm_extra_body,
             default_headers=config.llm_default_headers,
+            ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.consolidation_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
             gemini_service_tier=config.llm_gemini_service_tier,
@@ -2373,11 +2378,57 @@ class MemoryEngine(MemoryEngineInterface):
 
         Also checks if this is a child operation and updates the parent if all siblings are done.
         Uses a single transaction to avoid race conditions when multiple children complete simultaneously.
+
+        Opt-in escape hatch: when ``HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS`` is set and the
+        operation's ``result_metadata`` recorded a non-zero ``extraction_errors_count`` (written by
+        ``_write_retain_outcome_metadata`` before this call), the operation is marked ``failed``
+        instead of ``completed``. This surfaces silently-dropped facts as a hard failure rather
+        than a clean success. Default is off, so existing behavior is unchanged (see issue #2700).
         """
         try:
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
                 async with conn.transaction():
+                    # Read the accumulated extraction-error count (persisted by
+                    # _write_retain_outcome_metadata) to decide the terminal status.
+                    meta_row = await conn.fetchrow(
+                        f"SELECT result_metadata FROM {fq_table('async_operations')} WHERE operation_id = $1",
+                        uuid.UUID(operation_id),
+                    )
+                    extraction_errors_count = 0
+                    if meta_row is not None:
+                        metadata = conn.parse_json(meta_row["result_metadata"]) or {}
+                        extraction_errors_count = int(metadata.get("extraction_errors_count") or 0)
+
+                    fail_on_errors = get_config().fail_on_extraction_errors
+                    if fail_on_errors and extraction_errors_count > 0:
+                        error_message = (
+                            f"Retain completed with {extraction_errors_count} fact extraction error(s); "
+                            "marked failed because HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS is enabled. "
+                            "See result_metadata.extraction_errors_sample for details."
+                        )
+                        row = await conn.fetchrow(
+                            f"""
+                            UPDATE {fq_table("async_operations")}
+                            SET status = 'failed', error_message = $2, updated_at = NOW(), completed_at = NOW()
+                            WHERE operation_id = $1
+                            RETURNING operation_id
+                            """,
+                            uuid.UUID(operation_id),
+                            error_message,
+                        )
+                        if row is None:
+                            logger.info(
+                                f"Operation {operation_id} no longer exists (bank deleted), skipping mark-failed"
+                            )
+                            return
+                        logger.warning(
+                            f"Marked async operation as failed due to {extraction_errors_count} "
+                            f"extraction error(s): {operation_id}"
+                        )
+                        await self._maybe_update_parent_operation(operation_id, conn)
+                        return
+
                     # Mark this operation as completed
                     row = await conn.fetchrow(
                         f"""
@@ -6690,6 +6741,17 @@ class MemoryEngine(MemoryEngineInterface):
                         mentioned_at=live["mentioned_at"],
                         entities=[r["canonical_name"] for r in ent_rows],
                     )
+                    # Keep the stored text-search vector in sync with curated
+                    # text/context edits. Use the incoming parameters here:
+                    # PostgreSQL evaluates UPDATE RHS expressions before the
+                    # sibling SET assignments take effect, so column references
+                    # would see the pre-edit text/context.
+                    from .db.ops_postgresql import pg_search_vector_expr
+
+                    sv_expr = pg_search_vector_expr(get_config(), text_col="$3", context_col="$4")
+                    search_vector_clause = (
+                        f",\n                            search_vector = {sv_expr}" if sv_expr else ""
+                    )
                     await enqueue_relink_victims(conn, bank_id, [memory_id], ops=backend.ops)
                     await conn.execute(
                         f"""
@@ -6697,7 +6759,7 @@ class MemoryEngine(MemoryEngineInterface):
                         SET text = $3, context = $4, fact_type = $5, occurred_start = $6,
                             occurred_end = $7, event_date = $8, embedding = $9::vector,
                             consolidated_at = NULL, consolidation_failed_at = NULL,
-                            edited_at = now(), updated_at = now()
+                            edited_at = now(), updated_at = now(){search_vector_clause}
                         WHERE id = $1 AND bank_id = $2
                         """,
                         str(memory_uuid),
@@ -7517,7 +7579,7 @@ class MemoryEngine(MemoryEngineInterface):
                 f"""
                 SELECT id, text, event_date, context, fact_type, document_id,
                        mentioned_at, occurred_start, occurred_end, chunk_id, proof_count,
-                       tags, consolidated_at, consolidation_failed_at, edited_at, {curation_cols}
+                       tags, metadata, consolidated_at, consolidation_failed_at, edited_at, {curation_cols}
                 FROM {source_table}
                 {where_clause}
                 ORDER BY mentioned_at DESC NULLS LAST, created_at DESC
@@ -7572,6 +7634,7 @@ class MemoryEngine(MemoryEngineInterface):
                         "chunk_id": row["chunk_id"] if row["chunk_id"] else None,
                         "proof_count": row["proof_count"] if row["proof_count"] is not None else 1,
                         "tags": list(row["tags"]) if row["tags"] else [],
+                        "metadata": conn.parse_json(row["metadata"]) if row["metadata"] is not None else {},
                         "consolidated_at": row["consolidated_at"].isoformat() if row["consolidated_at"] else None,
                         "consolidation_failed_at": (
                             row["consolidation_failed_at"].isoformat() if row["consolidation_failed_at"] else None
@@ -7624,7 +7687,7 @@ class MemoryEngine(MemoryEngineInterface):
             # back to the archive (with its invalidation bookkeeping) on a miss.
             select_cols = (
                 "id, text, context, event_date, occurred_start, occurred_end, "
-                "mentioned_at, fact_type, document_id, chunk_id, tags, source_memory_ids, "
+                "mentioned_at, fact_type, document_id, chunk_id, tags, metadata, source_memory_ids, "
                 "observation_scopes, edited_at"
             )
             row = await conn.fetchrow(
@@ -7668,6 +7731,7 @@ class MemoryEngine(MemoryEngineInterface):
                 "document_id": row["document_id"] if row["document_id"] else None,
                 "chunk_id": str(row["chunk_id"]) if row["chunk_id"] else None,
                 "tags": row["tags"] if row["tags"] else [],
+                "metadata": conn.parse_json(row["metadata"]) if row["metadata"] is not None else {},
                 "observation_scopes": row["observation_scopes"] if row["observation_scopes"] else None,
                 "state": unit_state,
                 "invalidation_reason": row["invalidation_reason"],
@@ -11972,22 +12036,11 @@ class MemoryEngine(MemoryEngineInterface):
         op_uuid = uuid.UUID(operation_id)
 
         async with acquire_with_retry(backend) as conn:
-            row = await conn.fetchrow(
-                f"SELECT bank_id, status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
-                op_uuid,
-                bank_id,
-            )
-
-            if not row:
-                raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
-
-            if row["status"] not in ("failed", "cancelled"):
-                raise OperationValidationError(
-                    f"Operation {operation_id} cannot be retried: status is '{row['status']}', expected 'failed' or 'cancelled'",
-                    409,
-                )
-
-            await conn.execute(
+            # Make the retry transition a single conditional write. This
+            # coordinates with retention cleanup's row locks: either retry wins
+            # and the row becomes nonterminal, or pruning wins and this call
+            # returns not-found instead of falsely acknowledging a vanished job.
+            updated = await conn.fetchrow(
                 f"""
                 UPDATE {fq_table("async_operations")}
                 SET status = 'pending',
@@ -11999,9 +12052,26 @@ class MemoryEngine(MemoryEngineInterface):
                     retry_count = 0,
                     updated_at = NOW()
                 WHERE operation_id = $1
+                  AND bank_id = $2
+                  AND status IN ('failed', 'cancelled')
+                RETURNING operation_id
                 """,
                 op_uuid,
+                bank_id,
             )
+
+            if updated is None:
+                row = await conn.fetchrow(
+                    f"SELECT status FROM {fq_table('async_operations')} WHERE operation_id = $1 AND bank_id = $2",
+                    op_uuid,
+                    bank_id,
+                )
+                if not row:
+                    raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
+                raise OperationValidationError(
+                    f"Operation {operation_id} cannot be retried: status is '{row['status']}', expected 'failed' or 'cancelled'",
+                    409,
+                )
 
             return {
                 "success": True,
