@@ -10631,18 +10631,7 @@ class MemoryEngine(MemoryEngineInterface):
             # Read reflect options from trigger (if stored)
             trigger_data = mental_model.get("trigger") or {}
             fact_types = trigger_data.get("fact_types")
-            # local(tars) 2026-07-17: default to excluding ALL mental models during
-            # (re)generation. A mental model is a synthesis of ground-truth facts,
-            # not of other models. With the previous default (False), reflect's
-            # forced search_mental_models could return an OFF-TOPIC sibling model,
-            # deem it "usable and fresh" (reflect/agent.py:1132
-            # _all_mental_models_are_usable_and_fresh), short-circuit the forced
-            # lower-level retrieval, and answer from the sibling instead of the
-            # topic's own facts — producing empty "no info" models even when recall
-            # has dozens of matching facts. Excluding models disables the
-            # search_mental_models tool (memory_engine.py:9251), forcing
-            # observation/recall retrieval. A trigger can still opt back in.
-            exclude_mental_models = trigger_data.get("exclude_mental_models", True)
+            exclude_mental_models = trigger_data.get("exclude_mental_models", False)
             stored_exclude_ids: list[str] = trigger_data.get("exclude_mental_model_ids") or []
             recall_include_chunks_override = trigger_data.get("include_chunks")
             recall_max_tokens_override = trigger_data.get("recall_max_tokens")
